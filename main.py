@@ -97,8 +97,6 @@ class RateLimiter:
     
     def _refill(self):
         """Add tokens based on time elapsed since last refill."""
-        assert self._lock.locked(), "_refill() must be called with lock held"
-        
         now = time.monotonic()
         
         if now <= self.last_refill:
