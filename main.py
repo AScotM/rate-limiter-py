@@ -1,5 +1,6 @@
 import time
 import threading
+import warnings
 from typing import Optional, Dict, Any, Union
 
 
@@ -36,6 +37,12 @@ class RateLimiter:
             raise ValueError("Rate must be positive")
         if capacity <= 0:
             raise ValueError("Capacity must be positive")
+
+        if rate_per_second > 1000:
+            warnings.warn(
+                f"Rate {rate_per_second}/sec may be limited by system sleep precision. "
+                f"Consider using a larger rate or different approach for very high throughput."
+            )
 
     def _validate_count(self, count: Union[float, int]) -> float:
         if count is None:
@@ -79,7 +86,7 @@ class RateLimiter:
     def _refill(self):
         now = time.monotonic()
 
-        if now <= self.last_refill:
+        if now <= self.last_refill + 1e-12:
             return
 
         elapsed = now - self.last_refill
@@ -126,28 +133,29 @@ class RateLimiter:
                 if self._try_consume_locked(count):
                     return True
 
-                if self.tokens >= count:
-                    wait_time = 0.0
-                else:
+                wait_time = 0.0
+                if self.tokens < count:
                     wait_time = (count - self.tokens) / self.rate
 
-            if max_wait_seconds is not None:
-                elapsed = time.monotonic() - start
+                if max_wait_seconds is not None:
+                    elapsed = time.monotonic() - start
+                    if elapsed >= max_wait_seconds:
+                        return False
+                    remaining = max_wait_seconds - elapsed
+                    if wait_time > remaining:
+                        wait_time = remaining
+                    if wait_time <= 0:
+                        return False
 
-                if elapsed >= max_wait_seconds:
-                    return False
-
-                remaining = max_wait_seconds - elapsed
-                wait_time = min(wait_time, remaining)
-
-                if wait_time <= 0:
-                    return False
+                self.total_wait_loops += 1
 
             if wait_time > 0:
-                with self._lock:
-                    self.total_wait_loops += 1
-
                 time.sleep(max(wait_time, self.MIN_SLEEP))
+            else:
+                time.sleep(self.MIN_SLEEP)
+
+    def wait_and_consume(self, count: float = 1) -> None:
+        self.wait_for_tokens(count, max_wait_seconds=None)
 
     def get_available_tokens(self) -> float:
         with self._lock:
@@ -156,6 +164,12 @@ class RateLimiter:
 
     def get_available_tokens_int(self) -> int:
         return int(self.get_available_tokens())
+
+    def get_available_percentage(self) -> float:
+        return self.get_available_tokens() / self.capacity
+
+    def is_full(self) -> bool:
+        return self.get_available_tokens() >= self.capacity - 1e-9
 
     def get_capacity(self) -> float:
         return self.capacity
@@ -199,6 +213,12 @@ class RateLimiter:
             self.total_denied = 0
             self.total_grants = 0
             self.total_wait_loops = 0
+
+    def __repr__(self) -> str:
+        return (
+            f"RateLimiter(rate={self.rate}, capacity={self.capacity}, "
+            f"tokens={self.get_available_tokens():.3f})"
+        )
 
     def __enter__(self):
         return self
@@ -260,3 +280,23 @@ if __name__ == "__main__":
         print("  Failed to get 8 tokens within 1 second")
 
     print(f"\nFinal tokens: {limiter.get_available_tokens():.3f}")
+
+    print(f"\nRepr: {limiter}")
+    print(f"Is full: {limiter.is_full()}")
+    print(f"Available percentage: {limiter.get_available_percentage():.2%}")
+
+    print("\nTesting wait_and_consume:")
+    limiter.reset()
+    limiter.consume(5)
+    print(f"After consuming 5 tokens: {limiter.get_available_tokens():.3f}")
+    
+    def background_consumer():
+        time.sleep(0.5)
+        limiter.wait_and_consume(3)
+        print(f"Background consumed 3 tokens, remaining: {limiter.get_available_tokens():.3f}")
+    
+    t = threading.Thread(target=background_consumer)
+    t.start()
+    time.sleep(0.1)
+    print(f"Main thread tokens before background completes: {limiter.get_available_tokens():.3f}")
+    t.join()
